@@ -44,7 +44,7 @@ pi install git:github.com/F1LT3R/pi-paste-image-to-model
 
 Pin a version with `@<tag-or-sha>`, e.g. `...@v0.1.0`.
 
-**3. npm — requires publishing first (`npm publish`):**
+**3. npm:**
 
 ```bash
 pi install npm:pi-paste-image-to-model
