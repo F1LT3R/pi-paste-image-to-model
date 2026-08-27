@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "shortcut": "ctrl+v",
+  "provider": "openrouter",
+  "model": "google/gemini-2.5-flash",
+  "historyChars": 4000,
+  "marker": "[image queued]"
+}
