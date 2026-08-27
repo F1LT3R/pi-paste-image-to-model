@@ -7,6 +7,10 @@
  * VL model's analysis is injected into the main (text-only) model's context
  * as a persistent custom message, so the main model "sees" the image as text.
  *
+ * The extension also registers an `image_relay` tool the agent can call
+ * directly: image_relay({ path, prompt? }) sends an image file to the VL
+ * model and returns the analysis as a tool result.
+ *
  * Trigger mechanism (shortcut + clipboard read + queue + marker + `input`
  * transform) is based on pi-image-tools by MasuRii:
  * https://github.com/MasuRii/pi-image-tools
@@ -21,9 +25,10 @@
  *          (_MODEL accepts "provider/modelId" or a bare model id)
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { extname, join, resolve } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 // ------------------------------------------------------------------ config
 
@@ -225,6 +230,33 @@ function countOccurrences(text: string, token: string): number {
   }
 }
 
+// ------------------------------------------------- image file type sniffing
+
+function sniffImageMime(bytes: Buffer, fallbackExt: string): string | null {
+  if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return "image/png";
+  }
+  if (bytes.length > 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+    return "image/gif";
+  }
+  if (
+    bytes.length > 12 &&
+    bytes.toString("ascii", 0, 4) === "RIFF" &&
+    bytes.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  const ext = fallbackExt.toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return null;
+}
+
 // ------------------------------------------------------------------ plugin
 
 export default function pasteImageToModel(pi: ExtensionAPI): void {
@@ -370,9 +402,17 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
       return {
         message: {
           customType: "pi-paste-image-to-model",
-          content: `[Image relay — ${cfg.provider}/${cfg.model} analysis]\n${description}`,
+          content: `[Image relay — ${cfg.provider}/${cfg.model} description of the image(s) the user pasted]\n${description}`,
           display: true,
         },
+        systemPrompt: [
+          "The user attached image(s) this turn that you cannot see (you are text-only).",
+          "The custom message '[Image relay — …]' contains the vision model's description of those image(s).",
+          "Treat that description as the image's contents for this turn: answer questions about the image from it and quote relevant parts when asked.",
+          "Do not claim to have seen the pixels, and do not invent visual details that are not in the description.",
+          "The description comes from another model and may contain small errors or omissions; if it conflicts with what the user said, trust the user and ask for clarification.",
+          "If the description is missing something the user's question needs, ask the user to re-describe or re-paste the image.",
+        ].join(" "),
       };
     } catch (error) {
       if (ctx.hasUI) {
@@ -382,5 +422,132 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
         );
       }
     }
+  });
+
+  // ------------------------------------------------------------------ tool
+  // The agent can relay images itself: image_relay({ path, prompt? }) reads
+  // an image file, sends it to the configured VL model, and returns the
+  // analysis as a normal tool result — no pixels reach the main model.
+  pi.registerTool({
+    name: "image_relay",
+    label: "Image Relay",
+    description: [
+      "Send an image file to the configured vision model and return its detailed text description of the image.",
+      "You cannot see images yourself: the returned text is your only view of the image's contents.",
+      "It is a third-party model's reading and may contain minor errors or omissions; if it conflicts with what the user said, trust the user and ask for clarification.",
+      "Use when you need to see a screenshot, photo, or diagram you cannot read directly.",
+    ].join(" "),
+    promptSnippet:
+      "Inspect an image file via the configured vision model (returns a text description to treat as the image's contents)",
+    promptGuidelines: [
+      "When image_relay returns, treat its text as the image's contents for the rest of the turn: answer from it, quote relevant parts, and do not claim to see pixels beyond what it describes.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({
+        description:
+          "Path to the image file (png/jpg/webp/gif). Relative paths resolve against the working directory.",
+      }),
+      prompt: Type.Optional(
+        Type.String({
+          description: "Optional question or context for the vision model about the image.",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params: any, signal: any, onUpdate: any, ctx: any) {
+      const err = (text: string) => ({
+        content: [{ type: "text" as const, text }],
+        details: { error: text },
+      });
+
+      if (signal?.aborted) return err("image_relay: cancelled.");
+      if (!cfg.provider || !cfg.model) {
+        return err(
+          `image_relay: no VL model configured — set "provider" and "model" in ${getConfigPath()} (see config.example.json).`,
+        );
+      }
+      const model = ctx.modelRegistry?.find?.(cfg.provider, cfg.model);
+      if (!model) {
+        return err(
+          `image_relay: model ${cfg.provider}/${cfg.model} not found in model registry. Check your models.json.`,
+        );
+      }
+      if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+        return err(`image_relay: no auth configured for ${cfg.provider}/${cfg.model}.`);
+      }
+
+      let rawPath = typeof params?.path === "string" ? params.path.trim() : "";
+      if (rawPath.startsWith("@")) rawPath = rawPath.slice(1); // some models prefix paths with @
+      if (rawPath.length === 0) return err('image_relay: missing required parameter "path".');
+      const absPath = resolve(ctx.cwd ?? process.cwd(), rawPath);
+      if (!existsSync(absPath)) return err(`image_relay: file not found: ${absPath}`);
+      let stats;
+      try {
+        stats = statSync(absPath);
+      } catch {
+        return err(`image_relay: cannot read file: ${absPath}`);
+      }
+      if (!stats.isFile()) return err(`image_relay: not a file: ${absPath}`);
+      if (stats.size > 15 * 1024 * 1024) {
+        return err(`image_relay: image too large (>15MB): ${absPath}`);
+      }
+
+      const bytes = readFileSync(absPath);
+      const mimeType = sniffImageMime(bytes, extname(absPath));
+      if (!mimeType) return err(`image_relay: unsupported image type (png/jpg/webp/gif): ${absPath}`);
+
+      onUpdate?.({
+        content: [{ type: "text" as const, text: `Relaying ${rawPath} to ${cfg.provider}/${cfg.model}…` }],
+      });
+
+      const promptText = [
+        "You are a vision model acting as the eyes of a text-only coding agent.",
+        "Analyze the attached image in full detail:",
+        "- all visible text, transcribed verbatim (code, errors, UI labels, numbers)",
+        "- layout and notable visual elements",
+        typeof params?.prompt === "string" && params.prompt.trim().length > 0
+          ? `The agent's question/context: ${params.prompt.trim()}`
+          : "Focus on what is most likely relevant to the agent's current task.",
+      ].join("\n");
+
+      try {
+        const response = await ctx.modelRegistry.complete(
+          model,
+          {
+            messages: [
+              {
+                role: "user" as const,
+                content: [
+                  { type: "text" as const, text: promptText },
+                  { type: "image" as const, data: bytes.toString("base64"), mimeType },
+                ],
+                timestamp: Date.now(),
+              },
+            ],
+          },
+          { cacheRetention: "none" },
+        );
+
+        const text = response.content
+          .filter((c: any) => c.type === "text")
+          .map((c: any) => c.text)
+          .join("\n")
+          .trim();
+        if (!text) return err("image_relay: VL model returned no text.");
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `[image_relay — ${cfg.provider}/${cfg.model} description of "${rawPath}"; treat this text as the image's contents]\n${text}`,
+            },
+          ],
+          details: { model: `${cfg.provider}/${cfg.model}`, image: rawPath },
+          ...(response?.usage ? { usage: response.usage } : {}),
+        };
+      } catch (error) {
+        return err(
+          `image_relay: relay failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    },
   });
 }

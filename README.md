@@ -151,6 +151,45 @@ The VL model's text answer is then injected as a persistent custom message
 (`[Image relay — <provider>/<model> analysis] …`) before the main model's turn
 starts. The raw image is **not** attached to your user message.
 
+## Agent tool: `image_relay`
+
+The extension also registers a tool the **agent can call itself**:
+
+| Parameter | Type | Description |
+| --------- | ---- | ----------- |
+| `path`    | string (required) | Path to the image file (png/jpg/webp/gif); relative paths resolve against the working directory. |
+| `prompt`  | string (optional) | Question or context for the VL model about the image. |
+
+Example of what the LLM sees as the tool result:
+
+```
+image_relay({ "path": "/tmp/screenshot.png", "prompt": "what's the error in this terminal?" })
+→ <the VL model's analysis, as plain text>
+```
+
+The image never reaches the main model — only the text analysis does, as a
+normal tool result. This lets the agent inspect screenshots, photos, and
+diagrams on its own (e.g. right after taking a screenshot with a shell
+command) without you pasting anything.
+
+## How the main model learns to handle relayed images
+
+The relayed text is framed so the text-only model isn't surprised by it:
+
+- **Paste path:** when a relayed image injects the custom message, the same
+  `before_agent_start` hook returns a per-turn `systemPrompt` telling the
+  model the message is a vision model's description of the user's image,
+  that it should treat it as the image's contents, and that it must not
+  invent visual details or claim to have seen pixels.
+- **Tool path:** the `image_relay` tool description, its `promptGuidelines`,
+  and a one-line header on every tool result all say the same thing — the
+  returned text is your only view of the image, it is a third-party reading
+  (may contain small errors), and if it conflicts with the user, the user
+  wins.
+
+No AGENTS.md entry is needed; the guidance ships with the extension and
+applies to anyone who installs it.
+
 ## Credits
 
 This extension is based on
