@@ -97,6 +97,8 @@ All of it is optional and lives in **`~/.pi/agent/paste-image-to-model.json`**
 | `model`        | string  | — (required)¹    | Model id from your `~/.pi/agent/models.json` (vision-capable).     |
 | `historyChars` | number  | `4000`           | How many **trailing characters** of the conversation to send to the VL model. `0` = no history. |
 | `marker`       | string  | `"[image queued]"` | Marker text inserted into the editor when you paste an image.     |
+| `relayTimeoutMs` | number | `120000`        | Hard timeout for the VL model call. If it expires you get an error notification and the turn continues without the image — pi can never wedge on a relay. |
+| `vlMaxTokens`  | number  | `1024`           | Max tokens the VL model may generate. Small local models can ramble to their max; lower = faster. |
 
 ¹ If `provider`/`model` are missing, the shortcut still works but the relay is
 skipped with a clear notification telling you to configure them.
@@ -110,6 +112,8 @@ skipped with a clear notification telling you to configure them.
 | `PI_PASTE_IMAGE_TO_MODEL_PROVIDER`    | `provider`         |
 | `PI_PASTE_IMAGE_TO_MODEL_MODEL`       | `model`¹           |
 | `PI_PASTE_IMAGE_TO_MODEL_HISTORY_CHARS` | `historyChars`   |
+| `PI_PASTE_IMAGE_TO_MODEL_RELAY_TIMEOUT_MS` | `relayTimeoutMs` |
+| `PI_PASTE_IMAGE_TO_MODEL_VL_MAX_TOKENS`    | `vlMaxTokens`    |
 
 ¹ The `_MODEL` variable accepts either a bare model id or `"provider/modelId"`.
 
@@ -189,6 +193,20 @@ The relayed text is framed so the text-only model isn't surprised by it:
 
 No AGENTS.md entry is needed; the guidance ships with the extension and
 applies to anyone who installs it.
+
+## If a relay looks stuck
+
+The VL call is bounded: a JS-side timer (`relayTimeoutMs`, default 120 s)
+**and** the provider `timeoutMs` both abort it, and the `image_relay` tool
+also follows your interrupt. On timeout you get a notification and your turn
+starts anyway. If relays are slow or failing:
+
+1. Check the VL server is up: `curl -s <baseUrl>/v1/models`.
+2. Lower `vlMaxTokens` — small models asked to be "thorough" can generate
+   thousands of tokens, which on a consumer GPU means minutes of invisible
+   waiting.
+3. Lower `historyChars` — the relay sends the history tail to the VL model.
+4. Use a faster VL model/provider.
 
 ## Credits
 

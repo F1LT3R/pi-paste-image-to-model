@@ -21,7 +21,7 @@
  *       "provider": "my-vl-provider", "model": "my-vl-model",
  *       "historyChars": 4000, "marker": "[image queued]" }
  *   env:   PI_PASTE_IMAGE_TO_MODEL_ENABLED / _SHORTCUT / _PROVIDER / _MODEL
- *          / _HISTORY_CHARS
+ *          / _HISTORY_CHARS / _RELAY_TIMEOUT_MS / _VL_MAX_TOKENS
  *          (_MODEL accepts "provider/modelId" or a bare model id)
  */
 import { spawnSync } from "node:child_process";
@@ -46,6 +46,10 @@ export interface PasteImageToModelConfig {
   historyChars: number;
   /** Marker inserted into the editor when an image is queued. */
   marker: string;
+  /** Hard timeout (ms) for the VL model call. The turn proceeds if it expires. */
+  relayTimeoutMs: number;
+  /** Max tokens the VL model may generate for a description. */
+  vlMaxTokens: number;
 }
 
 export function getConfigPath(): string {
@@ -65,6 +69,8 @@ export function loadConfig(): PasteImageToModelConfig {
     model: undefined,
     historyChars: 4000,
     marker: "[image queued]",
+    relayTimeoutMs: 120000,
+    vlMaxTokens: 1024,
   };
 
   const path = getConfigPath();
@@ -91,6 +97,20 @@ export function loadConfig(): PasteImageToModelConfig {
         }
         if (typeof raw.marker === "string" && raw.marker.length > 0) {
           cfg.marker = raw.marker;
+        }
+        if (
+          typeof raw.relayTimeoutMs === "number" &&
+          Number.isFinite(raw.relayTimeoutMs) &&
+          raw.relayTimeoutMs >= 1000
+        ) {
+          cfg.relayTimeoutMs = Math.floor(raw.relayTimeoutMs);
+        }
+        if (
+          typeof raw.vlMaxTokens === "number" &&
+          Number.isFinite(raw.vlMaxTokens) &&
+          raw.vlMaxTokens > 0
+        ) {
+          cfg.vlMaxTokens = Math.floor(raw.vlMaxTokens);
         }
       }
     } catch (error) {
@@ -128,6 +148,16 @@ export function loadConfig(): PasteImageToModelConfig {
   const historyChars = env("HISTORY_CHARS");
   if (historyChars && /^\d+$/.test(historyChars)) {
     cfg.historyChars = parseInt(historyChars, 10);
+  }
+
+  const relayTimeoutMs = env("RELAY_TIMEOUT_MS");
+  if (relayTimeoutMs && /^\d+$/.test(relayTimeoutMs) && parseInt(relayTimeoutMs, 10) >= 1000) {
+    cfg.relayTimeoutMs = parseInt(relayTimeoutMs, 10);
+  }
+
+  const vlMaxTokens = env("VL_MAX_TOKENS");
+  if (vlMaxTokens && /^\d+$/.test(vlMaxTokens) && parseInt(vlMaxTokens, 10) > 0) {
+    cfg.vlMaxTokens = parseInt(vlMaxTokens, 10);
   }
 
   return cfg;
@@ -257,6 +287,78 @@ function sniffImageMime(bytes: Buffer, fallbackExt: string): string | null {
   return null;
 }
 
+// --------------------------------------------------------- shared VL call
+// One shared path for the paste relay and the image_relay tool. Bounded by
+// relayTimeoutMs (JS-side timer + provider timeoutMs) and an AbortSignal, so
+// a slow or stuck VL server can never wedge the agent: on timeout the turn
+// continues without the image.
+
+async function relayToVL(
+  ctx: any,
+  cfg: PasteImageToModelConfig,
+  model: any,
+  images: { data: string; mimeType: string }[],
+  promptText: string,
+  outerSignal?: AbortSignal,
+): Promise<{ text?: string; error?: string }> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error("relay timeout"));
+  }, cfg.relayTimeoutMs);
+  let onAbort: (() => void) | undefined;
+  if (outerSignal) {
+    onAbort = () => controller.abort(new Error("aborted"));
+    if (outerSignal.aborted) onAbort();
+    else outerSignal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const response = await ctx.modelRegistry.complete(
+      model,
+      {
+        messages: [
+          {
+            role: "user" as const,
+            content: [
+              { type: "text" as const, text: promptText },
+              ...images.map((img) => ({
+                type: "image" as const,
+                data: img.data,
+                mimeType: img.mimeType,
+              })),
+            ],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      {
+        cacheRetention: "none",
+        maxTokens: cfg.vlMaxTokens,
+        timeoutMs: cfg.relayTimeoutMs,
+        signal: controller.signal,
+      },
+    );
+    const text = response.content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n")
+      .trim();
+    return text ? { text } : { error: "VL model returned no text" };
+  } catch (error) {
+    if (timedOut) {
+      return {
+        error: `VL model timed out after ${Math.round(cfg.relayTimeoutMs / 1000)}s — image not relayed`,
+      };
+    }
+    if (controller.signal.aborted) return { error: "cancelled" };
+    return { error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    clearTimeout(timer);
+    if (outerSignal && onAbort) outerSignal.removeEventListener("abort", onAbort);
+  }
+}
+
 // ------------------------------------------------------------------ plugin
 
 export default function pasteImageToModel(pi: ExtensionAPI): void {
@@ -351,6 +453,7 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
       ctx.ui.notify(`Relaying ${images.length} image(s) to ${cfg.provider}/${cfg.model}…`, "info");
     }
 
+    const startedAt = Date.now();
     try {
       const history = conversationTail(ctx.sessionManager, cfg.historyChars);
       const promptText = [
@@ -370,34 +473,23 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
         "- all visible text, transcribed verbatim (code, errors, UI labels, numbers)",
         "- layout and notable visual elements",
         "- anything the user's current message points at",
-        "Be thorough and structured. This description is the primary model's only view of the image.",
+        "Be thorough but concise (under ~200 words) unless the image contains dense text (code, tables, logs) that must be transcribed verbatim.",
+        "This description is the primary model's only view of the image.",
       ].join("\n");
 
-      const response = await ctx.modelRegistry.complete(
-        model,
-        {
-          messages: [
-            {
-              role: "user" as const,
-              content: [
-                { type: "text" as const, text: promptText },
-                ...images.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
-              ],
-              timestamp: Date.now(),
-            },
-          ],
-        },
-        { cacheRetention: "none" },
-      );
-
-      const description = response.content
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text)
-        .join("\n")
-        .trim();
-      if (!description) {
-        if (ctx.hasUI) ctx.ui.notify("pi-paste-image-to-model: VL model returned no text", "warning");
+      const result = await relayToVL(ctx, cfg, model, images, promptText);
+      if (result.error) {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `pi-paste-image-to-model: ${result.error}. The turn continues without the image.`,
+            "error",
+          );
+        }
         return;
+      }
+      const description = result.text;
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Relay done in ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`, "info");
       }
       return {
         message: {
@@ -504,50 +596,31 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
         "Analyze the attached image in full detail:",
         "- all visible text, transcribed verbatim (code, errors, UI labels, numbers)",
         "- layout and notable visual elements",
+        "Be thorough but concise (under ~200 words) unless dense text must be transcribed verbatim.",
         typeof params?.prompt === "string" && params.prompt.trim().length > 0
           ? `The agent's question/context: ${params.prompt.trim()}`
           : "Focus on what is most likely relevant to the agent's current task.",
       ].join("\n");
 
-      try {
-        const response = await ctx.modelRegistry.complete(
-          model,
+      const result = await relayToVL(
+        ctx,
+        cfg,
+        model,
+        [{ data: bytes.toString("base64"), mimeType }],
+        promptText,
+        signal,
+      );
+      if (result.error) return err(`image_relay: ${result.error}.`);
+      const text = result.text;
+      return {
+        content: [
           {
-            messages: [
-              {
-                role: "user" as const,
-                content: [
-                  { type: "text" as const, text: promptText },
-                  { type: "image" as const, data: bytes.toString("base64"), mimeType },
-                ],
-                timestamp: Date.now(),
-              },
-            ],
+            type: "text" as const,
+            text: `[image_relay — ${cfg.provider}/${cfg.model} description of "${rawPath}"; treat this text as the image's contents]\n${text}`,
           },
-          { cacheRetention: "none" },
-        );
-
-        const text = response.content
-          .filter((c: any) => c.type === "text")
-          .map((c: any) => c.text)
-          .join("\n")
-          .trim();
-        if (!text) return err("image_relay: VL model returned no text.");
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `[image_relay — ${cfg.provider}/${cfg.model} description of "${rawPath}"; treat this text as the image's contents]\n${text}`,
-            },
-          ],
-          details: { model: `${cfg.provider}/${cfg.model}`, image: rawPath },
-          ...(response?.usage ? { usage: response.usage } : {}),
-        };
-      } catch (error) {
-        return err(
-          `image_relay: relay failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+        ],
+        details: { model: `${cfg.provider}/${cfg.model}`, image: rawPath },
+      };
     },
   });
 }

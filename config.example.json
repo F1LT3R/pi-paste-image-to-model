@@ -4,5 +4,7 @@
   "provider": "openrouter",
   "model": "google/gemini-2.5-flash",
   "historyChars": 4000,
-  "marker": "[image queued]"
+  "marker": "[image queued]",
+  "relayTimeoutMs": 120000,
+  "vlMaxTokens": 1024
 }
