@@ -1,5 +1,7 @@
 # pi-paste-image-to-model
 
+![Pasting image of a cat for analysis with another model](./preview.png)
+
 Paste an image in the [Pi Coding Agent](https://pi.dev) TUI, and have it
 **relayed to a vision (VL) model together with recent chat context and your
 prompt** — with the analysis injected back into your main (text-only) model's
