@@ -497,14 +497,20 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
           content: `[Image relay — ${cfg.provider}/${cfg.model} description of the image(s) the user pasted]\n${description}`,
           display: true,
         },
-        systemPrompt: [
-          "The user attached image(s) this turn that you cannot see (you are text-only).",
-          "The custom message '[Image relay — …]' contains the vision model's description of those image(s).",
-          "Treat that description as the image's contents for this turn: answer questions about the image from it and quote relevant parts when asked.",
-          "Do not claim to have seen the pixels, and do not invent visual details that are not in the description.",
-          "The description comes from another model and may contain small errors or omissions; if it conflicts with what the user said, trust the user and ask for clarification.",
-          "If the description is missing something the user's question needs, ask the user to re-describe or re-paste the image.",
-        ].join(" "),
+        // APPEND to the base prompt — returning a bare fragment would
+        // REPLACE it for the turn (docs: "Replace the system prompt for
+        // this turn"), stripping the agent's tools/identity/rules.
+        systemPrompt:
+          (typeof event.systemPrompt === "string" ? event.systemPrompt : "") +
+          "\n\n" +
+          [
+            "The user attached image(s) this turn that you cannot see (you are text-only).",
+            "The custom message '[Image relay — …]' contains the vision model's description of those image(s).",
+            "Treat that description as the image's contents for this turn: answer questions about the image from it and quote relevant parts when asked.",
+            "Do not claim to have seen the pixels, and do not invent visual details that are not in the description.",
+            "The description comes from another model and may contain small errors or omissions; if it conflicts with what the user said, trust the user and ask for clarification.",
+            "If the description is missing something the user's question needs, ask the user to re-describe or re-paste the image.",
+          ].join(" "),
       };
     } catch (error) {
       if (ctx.hasUI) {
