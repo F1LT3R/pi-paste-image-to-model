@@ -171,6 +171,12 @@ image_describe({ "path": "/tmp/screenshot.png", "prompt": "what's the error in t
 → <the VL model's analysis, as plain text>
 ```
 
+The TUI call line shows your query alongside the target file:
+
+```
+image_describe "what's the error in this terminal?" → /tmp/screenshot.png
+```
+
 The image never reaches the main model — only the text analysis does, as a
 normal tool result. This lets the agent inspect screenshots, photos, and
 diagrams on its own (e.g. right after taking a screenshot with a shell

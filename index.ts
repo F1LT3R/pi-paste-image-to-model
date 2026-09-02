@@ -28,6 +28,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ------------------------------------------------------------------ config
@@ -550,6 +551,19 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
           "Required. Your question or context about the image — what you need from it. The vision model sees no other context (no conversation history), so be specific.",
       }),
     }),
+    // Show the query (prompt) and target file on the TUI call line,
+    // mirroring text_to_image's renderCall.
+    renderCall(args: any, theme: any, context: any) {
+      const text = (context?.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      const prompt = typeof args?.prompt === "string" ? args.prompt : "";
+      let content = theme.fg("toolTitle", theme.bold("image_describe "));
+      content += theme.fg("muted", prompt ? `"${prompt}"` : "(no prompt)");
+      if (typeof args?.path === "string" && args.path) {
+        content += theme.fg("dim", ` → ${args.path}`);
+      }
+      text.setText(content);
+      return text;
+    },
     async execute(_toolCallId, params: any, signal: any, onUpdate: any, ctx: any) {
       const err = (text: string) => ({
         content: [{ type: "text" as const, text }],
