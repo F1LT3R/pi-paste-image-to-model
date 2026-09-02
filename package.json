@@ -1,6 +1,6 @@
 {
   "name": "pi-paste-image-to-model",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Paste an image in Pi TUI; relay it with recent chat context and your prompt to a vision model, and inject the analysis into the main model's context",
   "type": "module",
   "main": "./index.ts",
@@ -25,7 +25,7 @@
     "clipboard",
     "vision",
     "vl-model",
-    "image-relay"
+    "image-describe"
   ],
   "author": "F1LT3R",
   "license": "MIT",

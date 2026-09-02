@@ -7,8 +7,8 @@
  * VL model's analysis is injected into the main (text-only) model's context
  * as a persistent custom message, so the main model "sees" the image as text.
  *
- * The extension also registers an `image_relay` tool the agent can call
- * directly: image_relay({ path, prompt? }) sends an image file to the VL
+ * The extension also registers an `image_describe` tool the agent can call
+ * directly: image_describe({ path, prompt }) sends an image file to the VL
  * model and returns the analysis as a tool result.
  *
  * Trigger mechanism (shortcut + clipboard read + queue + marker + `input`
@@ -288,7 +288,7 @@ function sniffImageMime(bytes: Buffer, fallbackExt: string): string | null {
 }
 
 // --------------------------------------------------------- shared VL call
-// One shared path for the paste relay and the image_relay tool. Bounded by
+// One shared path for the paste relay and the image_describe tool. Bounded by
 // relayTimeoutMs (JS-side timer + provider timeoutMs) and an AbortSignal, so
 // a slow or stuck VL server can never wedge the agent: on timeout the turn
 // continues without the image.
@@ -523,12 +523,12 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
   });
 
   // ------------------------------------------------------------------ tool
-  // The agent can relay images itself: image_relay({ path, prompt? }) reads
+  // The agent can describe images itself: image_describe({ path, prompt }) reads
   // an image file, sends it to the configured VL model, and returns the
   // analysis as a normal tool result — no pixels reach the main model.
   pi.registerTool({
-    name: "image_relay",
-    label: "Image Relay",
+    name: "image_describe",
+    label: "Image Describe",
     description: [
       "Send an image file to the configured vision model and return its detailed text description of the image.",
       "You cannot see images yourself: the returned text is your only view of the image's contents.",
@@ -538,18 +538,17 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
     promptSnippet:
       "Inspect an image file via the configured vision model (returns a text description to treat as the image's contents)",
     promptGuidelines: [
-      "When image_relay returns, treat its text as the image's contents for the rest of the turn: answer from it, quote relevant parts, and do not claim to see pixels beyond what it describes.",
+      "When image_describe returns, treat its text as the image's contents for the rest of the turn: answer from it, quote relevant parts, and do not claim to see pixels beyond what it describes.",
     ],
     parameters: Type.Object({
       path: Type.String({
         description:
           "Path to the image file (png/jpg/webp/gif). Relative paths resolve against the working directory.",
       }),
-      prompt: Type.Optional(
-        Type.String({
-          description: "Optional question or context for the vision model about the image.",
-        }),
-      ),
+      prompt: Type.String({
+        description:
+          "Required. Your question or context about the image — what you need from it. The vision model sees no other context (no conversation history), so be specific.",
+      }),
     }),
     async execute(_toolCallId, params: any, signal: any, onUpdate: any, ctx: any) {
       const err = (text: string) => ({
@@ -557,45 +556,52 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
         details: { error: text },
       });
 
-      if (signal?.aborted) return err("image_relay: cancelled.");
+      if (signal?.aborted) return err("image_describe: cancelled.");
       if (!cfg.provider || !cfg.model) {
         return err(
-          `image_relay: no VL model configured — set "provider" and "model" in ${getConfigPath()} (see config.example.json).`,
+          `image_describe: no VL model configured — set "provider" and "model" in ${getConfigPath()} (see config.example.json).`,
         );
       }
       const model = ctx.modelRegistry?.find?.(cfg.provider, cfg.model);
       if (!model) {
         return err(
-          `image_relay: model ${cfg.provider}/${cfg.model} not found in model registry. Check your models.json.`,
+          `image_describe: model ${cfg.provider}/${cfg.model} not found in model registry. Check your models.json.`,
         );
       }
       if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
-        return err(`image_relay: no auth configured for ${cfg.provider}/${cfg.model}.`);
+        return err(`image_describe: no auth configured for ${cfg.provider}/${cfg.model}.`);
       }
 
       let rawPath = typeof params?.path === "string" ? params.path.trim() : "";
       if (rawPath.startsWith("@")) rawPath = rawPath.slice(1); // some models prefix paths with @
-      if (rawPath.length === 0) return err('image_relay: missing required parameter "path".');
+      if (rawPath.length === 0) return err('image_describe: missing required parameter "path".');
       const absPath = resolve(ctx.cwd ?? process.cwd(), rawPath);
-      if (!existsSync(absPath)) return err(`image_relay: file not found: ${absPath}`);
+      if (!existsSync(absPath)) return err(`image_describe: file not found: ${absPath}`);
       let stats;
       try {
         stats = statSync(absPath);
       } catch {
-        return err(`image_relay: cannot read file: ${absPath}`);
+        return err(`image_describe: cannot read file: ${absPath}`);
       }
-      if (!stats.isFile()) return err(`image_relay: not a file: ${absPath}`);
+      if (!stats.isFile()) return err(`image_describe: not a file: ${absPath}`);
       if (stats.size > 15 * 1024 * 1024) {
-        return err(`image_relay: image too large (>15MB): ${absPath}`);
+        return err(`image_describe: image too large (>15MB): ${absPath}`);
       }
 
       const bytes = readFileSync(absPath);
       const mimeType = sniffImageMime(bytes, extname(absPath));
-      if (!mimeType) return err(`image_relay: unsupported image type (png/jpg/webp/gif): ${absPath}`);
+      if (!mimeType) return err(`image_describe: unsupported image type (png/jpg/webp/gif): ${absPath}`);
 
       onUpdate?.({
         content: [{ type: "text" as const, text: `Relaying ${rawPath} to ${cfg.provider}/${cfg.model}…` }],
       });
+
+      const prompt = typeof params?.prompt === "string" ? params.prompt.trim() : "";
+      if (prompt.length === 0) {
+        return err(
+          'image_describe: missing required parameter "prompt" — state what you need from the image (the vision model sees no other context).',
+        );
+      }
 
       const promptText = [
         "You are a vision model acting as the eyes of a text-only coding agent.",
@@ -603,9 +609,7 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
         "- all visible text, transcribed verbatim (code, errors, UI labels, numbers)",
         "- layout and notable visual elements",
         "Be thorough but concise (under ~200 words) unless dense text must be transcribed verbatim.",
-        typeof params?.prompt === "string" && params.prompt.trim().length > 0
-          ? `The agent's question/context: ${params.prompt.trim()}`
-          : "Focus on what is most likely relevant to the agent's current task.",
+        `The agent's question/context: ${prompt}`,
       ].join("\n");
 
       const result = await relayToVL(
@@ -616,13 +620,13 @@ export default function pasteImageToModel(pi: ExtensionAPI): void {
         promptText,
         signal,
       );
-      if (result.error) return err(`image_relay: ${result.error}.`);
+      if (result.error) return err(`image_describe: ${result.error}.`);
       const text = result.text;
       return {
         content: [
           {
             type: "text" as const,
-            text: `[image_relay — ${cfg.provider}/${cfg.model} description of "${rawPath}"; treat this text as the image's contents]\n${text}`,
+            text: `[image_describe — ${cfg.provider}/${cfg.model} description of "${rawPath}"; treat this text as the image's contents]\n${text}`,
           },
         ],
         details: { model: `${cfg.provider}/${cfg.model}`, image: rawPath },
